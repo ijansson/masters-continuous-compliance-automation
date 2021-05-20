@@ -1,0 +1,20 @@
+---
+
+accounts:
+#
+# Master account
+#
+
+  - account_name: TEMP
+    account_email: TEMP
+    default_region: eu-west-1
+    owner_email: TEMP
+    owner_costcenter: TEMP
+    manage_vpc: TEMP
+    manage_dns: TEMP
+    vpc_sub_domain: TEMP
+    tags:
+      Environment: TEMP
+      Application: TEMP
+      BusinessArea: TEMP
+      Customer: TEMP

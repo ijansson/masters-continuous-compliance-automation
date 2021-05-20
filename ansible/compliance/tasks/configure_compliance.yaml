@@ -1,0 +1,21 @@
+---
+
+- name: Configure AWS compliance CIS and PCI-DSS
+  cloudformation:
+    profile: "{{ account_item.account_name }}"
+    stack_name: "{{ account_item.account_name }}-LAB-compliance-cf"
+    state: "present"
+    region: "eu-west-1"
+    disable_rollback: true
+    template: "roles/compliance/files/configure_compliance.yaml"
+  register: register_compliance
+
+- name: Configure AWS compliance Cloudwatch Alarms CIS and PCI-DSS
+  cloudformation:
+    profile: "{{ account_item.account_name }}"
+    stack_name: "{{ account_item.account_name }}-LAB-compliance-cwAlarms-cf"
+    state: "present"
+    region: "eu-west-1"
+    disable_rollback: true
+    template: "roles/compliance/files/configure_complianceCloudWatchAlarms.yaml"
+

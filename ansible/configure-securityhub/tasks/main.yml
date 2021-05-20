@@ -1,0 +1,7 @@
+---
+
+- name: Configure default security hub document properties
+  include_tasks: configure_securityhub.yaml
+  with_items: "{{ accounts }}"
+  loop_control:
+    loop_var: account_item

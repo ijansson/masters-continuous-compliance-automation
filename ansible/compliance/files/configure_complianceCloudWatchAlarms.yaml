@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Create Custom CloudWatch Alarms CIS and PCI
+
+Resources:
+  SnsTopic1:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: TEMP
+          Protocol: email
+      TopicName: sns-topic
+  #TODO need to be replaced with the real cloudtrail logs 
+  CWLogGroupForCloudTrail:
+      Type: 'AWS::Logs::LogGroup'
+      Properties:
+        LogGroupName: CloudTrailLogs
+        RetentionInDays: 90
+  CwAlarmCIS34IAMPolicyChanges:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: iam_policy_changes
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers when changes are made to IAM policies. CIS 3.4
+      MetricName: IAMPolicyEventCount
+      Namespace: LogMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SnsTopic1
+      TreatMissingData: notBreaching
+  MetricFilterCIS34:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName:
+        Ref: CWLogGroupForCloudTrail
+      FilterPattern: >-
+        {($.eventName=DeleteGroupPolicy)||($.eventName=DeleteRolePolicy)||($.eventName=DeleteUserPolicy)||($.eventName=PutGroupPolicy)||($.eventName=PutRolePolicy)||($.eventName=PutUserPolicy)||($.eventName=CreatePolicy)||($.eventName=DeletePolicy)||($.eventName=CreatePolicyVersion)||($.eventName=DeletePolicyVersion)||($.eventName=AttachRolePolicy)||($.eventName=DetachRolePolicy)||($.eventName=AttachUserPolicy)||($.eventName=DetachUserPolicy)||($.eventName=AttachGroupPolicy)||($.eventName=DetachGroupPolicy)}
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: IAMPolicyEventCount
+  CwAlarmPCICW1:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: root_account_usage
+      AlarmDescription: >-
+        A log metric filter and alarm for usage of the "root" account PCI.CW.1
+      MetricName: RootAccountEventCount
+      Namespace: LogMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SnsTopic1
+      TreatMissingData: notBreaching
+  MetricFilterPCICW1:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName:
+        Ref: CWLogGroupForCloudTrail
+      FilterPattern: >-
+        { $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != "AwsServiceEvent" }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: RootAccountEventCount

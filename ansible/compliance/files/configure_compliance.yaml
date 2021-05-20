@@ -1,0 +1,1129 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Create Custom Security Hub automation with CloudWatch and Lambdas for Compliance remediation
+
+Resources:
+  ComplianceCIS15to111RLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Compliance_CIS_1-5_1-11_Remediation
+      Description: Remediates CIS Checks 1.5-1.11 Compliance by a CIS Compliant Strong Password Policy
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt ComplianceCIS15to111RLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          class ComplianceResult:
+              CORRECTED = 1
+              NOT_CORRECTABLE = 2
+              ERROR = 3
+              def result_to_str(result):
+                  switch = {
+                      1: 'CORRECTED',
+                      2: 'NOT_CORRECTABLE',
+                      3: 'ERROR'
+                  }
+                  return switch.get(result, '')
+
+          def lambda_handler(event, context):
+              print("Event: {}".format(event))
+              if 'Type' in event['detail']['findings'][0]['Resources'][0].keys():
+                account = str(event['detail']['findings'][0]['Resources'][0]['Id'])
+                findingId = str(event['detail']['findings'][0]['Id'])
+                lambdaFunctionName = os.environ['AWS_LAMBDA_FUNCTION_NAME']
+                generatorId = str(event['detail']['findings'][0]['GeneratorId'])
+                recordState = str(event['detail']['findings'][0]['RecordState'])
+                result = ComplianceResult.NOT_CORRECTABLE
+                result_msg = 'Not correctable'
+                if recordState != "ARCHIVED" :
+                  try:
+                      iam = boto3.client('iam')
+                      response = iam.update_account_password_policy(
+                          MinimumPasswordLength=16,
+                          RequireSymbols=True,
+                          RequireNumbers=True,
+                          RequireUppercaseCharacters=True,
+                          RequireLowercaseCharacters=True,
+                          AllowUsersToChangePassword=True,
+                          MaxPasswordAge=90,
+                          PasswordReusePrevention=24,
+                          HardExpiry=False
+                          )
+                      if response ['ResponseMetadata']['HTTPStatusCode'] == 200:
+                        result_msg = 'IAM Password Policy Updated :' 
+                        result = ComplianceResult.CORRECTED
+                      else:
+                        result_msg = str(response)
+                  except Exception as e:
+                      print(e)
+                      result_msg = str(e)
+                      result = ComplianceResult.ERROR
+                      
+                  if result == ComplianceResult.CORRECTED:
+                      try:
+                          securityhub = boto3.client('securityhub')
+                          response = securityhub.update_findings(
+                              Filters={'Id': [{'Value': findingId,
+                                          'Comparison': 'EQUALS'}]
+                              },
+                              Note={'Text': 'Automatic Remidiation was invoked. Refer to Automation results to determine efficacy: '+ result_msg,
+                                  'UpdatedBy': lambdaFunctionName},
+                              RecordState='ACTIVE'
+                          )
+                          print(response)
+                      except Exception as e:
+                          print(e)
+                          raise
+                print('{}/{}/{}'.format(lambdaFunctionName, ComplianceResult.result_to_str(result), result_msg))
+                statusCode = 200    
+                if result == ComplianceResult.ERROR:
+                    statusCode = 500
+                return {
+                    'statusCode': statusCode,
+                    'body': {
+                        "function":lambdaFunctionName,
+                        "result": ComplianceResult.result_to_str(result),
+                        "message": result_msg,
+                        "event": event
+                    }
+                } 
+              else:
+                print('Compliance event cannot be fixed')
+
+
+  ComplianceCIS15to111RLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: Compliance_CIS_1-5_1-11_LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - iam:UpdateAccountPasswordPolicy
+            - iam:PassRole
+            - securityhub:UpdateFindings
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+
+  ComplianceCIS4142RLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Compliance_CIS_4-1_4-2_Remediation
+      Description: Remediates CIS 4.1 and 4.2 Compliance by disabling Public SSH / RDP Rules on Security Groups
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt ComplianceCIS4142RLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import sys
+          import traceback
+          import string
+          import time
+          import os
+
+          FORBIDDEN_PORTS = [22,3389]
+
+          class ComplianceResult:
+              CORRECTED = 1
+              NOT_CORRECTABLE = 2
+              ERROR = 3
+              def result_to_str(result):
+                  switch = {
+                      1: 'CORRECTED',
+                      2: 'NOT_CORRECTABLE',
+                      3: 'ERROR'
+                  }
+                  return switch.get(result, '')
+
+          def fix_security_group(region, nonCompliantSgId,nonCompliantSgIdName):
+              aws_session = boto3.Session(region_name=region)
+              ec2 = aws_session.resource('ec2')
+
+              print ('Attempting to create compliance...')
+              sg = ec2.SecurityGroup(nonCompliantSgId)
+              result = ComplianceResult.NOT_CORRECTABLE
+              result_msg = 'No port found, ' + nonCompliantSgId 
+              try:
+                  for rule in sg.ip_permissions:
+                      if [cidr for cidr in rule['IpRanges'] if cidr['CidrIp'] == '0.0.0.0/0']:
+                          if rule['FromPort'] != rule['ToPort']:
+                              port_range = range(rule['FromPort'], rule['ToPort']+1)
+                              for port in port_range:
+                                  if port in FORBIDDEN_PORTS:
+                                      result_msg = 'Using port range, cannot create compliance.'+nonCompliantSgId+' '+nonCompliantSgIdName
+                              if result == ComplianceResult.NOT_CORRECTABLE:
+                                  continue
+                          port = rule['ToPort']
+                          if port in FORBIDDEN_PORTS:
+                              sg.revoke_ingress(IpProtocol=rule['IpProtocol'], FromPort=port, ToPort=port, CidrIp='0.0.0.0/0')
+                              time.sleep(1)
+                              result = ComplianceResult.CORRECTED
+                              result_msg = 'Non compliant security group removed '+nonCompliantSgId +' '+nonCompliantSgIdName
+              except:
+                  exc_type, exc_value, exc_traceback = sys.exc_info()
+                  lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+                  result_msg = ''.join('!! ' + line for line in lines)
+                  result = ComplianceResult.ERROR
+              return result, result_msg
+
+          def lambda_handler(event, context):
+              print('Event: {}'.format(event))
+              if 'Details' in event['detail']['findings'][0]['Resources'][0].keys():
+                  det = event['detail']['findings'][0]['Resources'][0]['Details']
+                  nonCompliantSgId = str(det['AwsEc2SecurityGroup']['GroupId'])
+                  nonCompliantSgIdName = str(det['AwsEc2SecurityGroup']['GroupName'])
+                  findingId = str(event['detail']['findings'][0]['Id'])
+                  region = str(event['detail']['findings'][0]['Resources'][0]['Region'])
+                  lambdaFunctionName = os.environ['AWS_LAMBDA_FUNCTION_NAME']
+                  result = ComplianceResult.NOT_CORRECTABLE
+                  if 'TEMP' in nonCompliantSgIdName:
+                      #TODO Add tags to filter out allowed security groups
+                      result,result_msg = fix_security_group(region, nonCompliantSgId,nonCompliantSgIdName)
+                  else:
+                      result_msg = 'Not compliance LAB security group'
+                  
+                  if result == ComplianceResult.CORRECTED:
+                      try:
+                          securityhub = boto3.client('securityhub')
+                          response = securityhub.update_findings(Filters={'Id': [{'Value': findingId,'Comparison': 'EQUALS'}]
+                              },Note={'Text': 'Automatic Remidiation was invoked. Refer to Automation results to determine efficacy:' + result_msg,
+                              'UpdatedBy': lambdaFunctionName},RecordState='ACTIVE')
+                          print(response)
+                      except Exception as e:
+                          print(e)
+                          raise
+                  print('{}/{}/{}'.format(lambdaFunctionName, ComplianceResult.result_to_str(result), result_msg))
+                  statusCode = 200    
+                  if result == ComplianceResult.ERROR:
+                      statusCode = 500
+                  return {
+                      'statusCode': statusCode,
+                      'body': {
+                          "function":lambdaFunctionName,
+                          "result": ComplianceResult.result_to_str(result),
+                          "message": result_msg,
+                          "event": event
+                      }
+                  } 
+              else:
+                  print('Compliance event cannot be fixed')
+
+  ComplianceCIS4142RLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: Compliance_CIS_4-1_4-2_LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ssm:StartAutomationExecution
+            - ec2:DescribeSecurityGroupReferences
+            - ec2:DescribeSecurityGroups
+            - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+            - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+            - ec2:RevokeSecurityGroupIngress
+            - ec2:RevokeSecurityGroupEgress
+            - iam:PassRole
+            - securityhub:UpdateFindings
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+
+  CompliancePCIS34RLambdaFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: Compliance_PCI_S3-4_Remediation
+        Description: Remediates PCI 3.4 S3 default encryption enabled 
+        Handler: index.lambda_handler
+        MemorySize: 256
+        Role: !GetAtt CompliancePCIS34RLambdaRole.Arn
+        Runtime: python3.7
+        Timeout: 60
+        Code:
+          ZipFile: |
+            import boto3
+            import json
+            import os
+            import time
+
+            class ComplianceResult:
+                CORRECTED = 1
+                NOT_CORRECTABLE = 2
+                ERROR = 3
+                def result_to_str(result):
+                    switch = {
+                        1: 'CORRECTED',
+                        2: 'NOT_CORRECTABLE',
+                        3: 'ERROR'
+                    }
+                    return switch.get(result, '')
+
+            def fix_encryption(noncompliantS3Bucket, lambdaFunctionName):
+                ssm = boto3.client('ssm')
+                try:
+                    enableS3BucketEncryption = ssm.start_automation_execution(
+                        DocumentName='AWS-EnableS3BucketEncryption',
+                        DocumentVersion='1', # default
+                        Parameters={
+                            'BucketName': [ noncompliantS3Bucket ]
+                        }
+                    )
+                    count = 5 # wait for reslult max 5 seconds 
+                    while count > 0:
+                        --count 
+                        automationExecutionResponse = ssm.get_automation_execution(
+                            AutomationExecutionId= enableS3BucketEncryption['AutomationExecutionId']
+                        )
+                        time.sleep(1) # wait on ssm result 
+                        print(automationExecutionResponse)
+                        status = automationExecutionResponse['AutomationExecution']['AutomationExecutionStatus']
+                        if status != 'Pending' and status != 'InProgress' and status != 'Cancelling' and status != 'Waiting':
+                            break
+                    
+                    if status == 'Success' :
+                        result = ComplianceResult.CORRECTED 
+                        result_msg = 'Compliance Corrected for ' + noncompliantS3Bucket
+                    else:
+                        result_msg = 'Cant create compliance, refere to lambda '+lambdaFunctionName+' loggs'
+                        if 'FailureMessage' in automationExecutionResponse['AutomationExecution'].keys():
+                            result_msg =  automationExecutionResponse['AutomationExecution']['FailureMessage']
+                        result = ComplianceResult.ERROR 
+
+                except Exception as e:
+                    result_msg = 'SSM automation failed' + str(e)
+                    result = ComplianceResult.ERROR
+                return result, result_msg
+
+            def lambda_handler(event, context):
+                if 'Details' in event['detail']['findings'][0]['Resources'][0].keys():
+                    rawBucketInfo = str(event['detail']['findings'][0]['Resources'][0]['Id'])
+                    findingId = str(event['detail']['findings'][0]['Id'])
+                    lambdaFunctionName = os.environ['AWS_LAMBDA_FUNCTION_NAME']
+                    noncompliantS3Bucket = rawBucketInfo.replace("arn:aws:s3:::", "")
+                    result = ComplianceResult.NOT_CORRECTABLE
+                    result_msg = 'Not correctable'
+                    securityhub = boto3.client('securityhub')
+                    if 'TEMP' in noncompliantS3Bucket:
+                        #TODO Tag in stead of name based filtering
+                        result, result_msg = fix_encryption(noncompliantS3Bucket, lambdaFunctionName)
+                    else:
+                        result_msg = 'Not compliance LAB security group'
+
+                    if result == ComplianceResult.CORRECTED:
+                        try:
+                            response = securityhub.update_findings(
+                                Filters={'Id': [{
+                                            'Value': findingId,
+                                            'Comparison': 'EQUALS'}]
+                                },
+                                Note={'Text': 'Systems Manager Automation add encryption to s3 was successfully invoked:'+,noncompliantS3Bucket
+                                    'UpdatedBy': lambdaFunctionName
+                                },
+                                RecordState='ACTIVE'
+                            )
+                        except Exception as e:
+                            print(e)
+                    print('{}/{}/{}'.format(lambdaFunctionName, ComplianceResult.result_to_str(result), result_msg))
+                    statusCode = 200    
+                    if result == ComplianceResult.ERROR:
+                        statusCode = 500
+                    return {
+                        'statusCode': statusCode,
+                        'body': {
+                            "function":lambdaFunctionName,
+                            "result": ComplianceResult.result_to_str(result),
+                            "message": result_msg,
+                            "event": event
+                        }
+                    }
+                else:
+                    print('Compliance event cannot be fixed')
+
+  CompliancePCIS34RLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: Compliance_PCI_S3-4_LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - s3:PutEncryptionConfiguration
+            - ssm:GetAutomationExecution
+            - iam:PassRole
+            - ssm:StartAutomationExecution
+            - securityhub:UpdateFindings
+            - lambda:InvokeFunction
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+
+  CompliancePCIIAM3RLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Compliance_PCI_IAM_3_Remediation
+      Description: Remediate PCI.IAM.3 IAM policies should not allow full "*" administrative privileges
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt CompliancePCIIAM3RLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          class ComplianceResult:
+              CORRECTED = 1
+              NOT_CORRECTABLE = 2
+              ERROR = 3
+              def result_to_str(result):
+                  switch = {
+                      1: 'CORRECTED',
+                      2: 'NOT_CORRECTABLE',
+                      3: 'ERROR'
+                  }
+                  return switch.get(result, '')
+
+          def lambda_handler(event, context):
+              print("Event: {}".format(event))
+              if 'Type' in event['detail']['findings'][0]['Resources'][0].keys():
+                  iamPolicy = str(event['detail']['findings'][0]['Resources'][0]['Id'])
+                  findingId = str(event['detail']['findings'][0]['Id'])
+                  region = str(event['detail']['findings'][0]['Resources'][0]['Region'])
+                  lambdaFunctionName = os.environ['AWS_LAMBDA_FUNCTION_NAME']
+                  generatorId = str(event['detail']['findings'][0]['GeneratorId'])
+                  recordState = str(event['detail']['findings'][0]['RecordState'])
+                  result = ComplianceResult.NOT_CORRECTABLE
+                  result_msg = 'Not correctable'
+                  if recordState != "ARCHIVED" :
+                      try:
+                          iam = boto3.client('iam')
+                          policy = iam.list_policy_versions(PolicyArn=iamPolicy)
+                          print(policy)
+                          # DeletePolicyVersion
+                          for pol in policy['Versions']:
+                              if pol['IsDefaultVersion'] == False:
+                                  iam.delete_policy_version(PolicyArn=iamPolicy, VersionId=pol['VersionId'])
+                              
+                          #TODO see if we need to detach something #ListEntitiesForPolicy #DetachUserPolicy, DetachGroupPolicy,DetachRolePolicy
+                          response = iam.delete_policy(PolicyArn=iamPolicy)
+                          
+                          if response ['ResponseMetadata']['HTTPStatusCode'] == 200:
+                              result_msg = 'IAM Policy Updated :' + iamPolicy
+                              result = ComplianceResult.CORRECTED
+                          else:
+                              result_msg = str(response)
+                      except Exception as e:
+                          print(e)
+                          result_msg = str(e)
+                          result = ComplianceResult.ERROR
+                          
+                      if result == ComplianceResult.CORRECTED:
+                          try:
+                              securityhub = boto3.client('securityhub')
+                              response = securityhub.update_findings(
+                                  Filters={'Id': [{
+                                              'Value': findingId,
+                                              'Comparison': 'EQUALS'}]
+                                  },
+                                  Note={'Text': 'Automatic Remidiation was invoked. Refer to Automation results to determine efficacy'+'IAM Policy Updated :' + iamPolicy,
+                                        'UpdatedBy': lambdaFunctionName
+                                  },
+                                  RecordState='ACTIVE'
+                              )
+                              print(response)
+                          except Exception as e:
+                              print(e)
+                              raise
+                  print('{}/{}/{}'.format(lambdaFunctionName, ComplianceResult.result_to_str(result), result_msg)) 
+                  statusCode = 200   
+                  if result == ComplianceResult.ERROR:
+                      statusCode = 500
+                  return {
+                      'statusCode': statusCode,
+                      'body': {
+                          "function":lambdaFunctionName,
+                          "result": ComplianceResult.result_to_str(result),
+                          "message": result_msg,
+                          "event": event
+                      }
+                  }  
+              else:
+                  print('Compliance event cannot be fixed')
+         
+  CompliancePCIIAM3RLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: Compliance_PCI_IAM-3_LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - iam:ListPolicies
+            - iam:ListPolicyVersions
+            - iam:DeletePolicy
+            - iam:DeletePolicyVersion
+            - iam:PassRole
+            - securityhub:UpdateFindings
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+
+  ComplianceAutomationFinalStateLambdaFunction:
+        Type: AWS::Lambda::Function
+        Properties:
+          FunctionName: ComplianceAutomationFinalState
+          Description: Finla state handler for Compliance Automation state machine
+          Handler: index.lambda_handler
+          MemorySize: 256
+          Role: !GetAtt ComplianceAutomationFinalStateLambdaRole.Arn
+          Runtime: python3.7
+          Timeout: 60
+          Code:
+            ZipFile: |
+              import json
+              import boto3
+
+              def publish_compliance_sns(message):
+                  sns = boto3.client('sns')
+                  a = sns.list_topics()
+                  dicts = a['Topics']
+                  # TODO sns topic should be linked not found by hardcoded string 
+                  arn = next((item for item in dicts if (item["TopicArn"]).find("sns-teams-compliance-topic") != -1), None)
+                  print(arn)
+                  if arn is not None:
+                      try:
+                          response = sns.publish(
+                              TargetArn=arn['TopicArn'],
+                              Message=json.dumps({'default': json.dumps(message)}),
+                              MessageStructure='json'
+                          )
+                          print(response)
+                      except Exception as e:
+                          print(e)
+                  else:
+                      print('No topic found')
+
+              def lambda_handler(event, context):
+                  print('Event: {}'.format(event))
+                  if event is not None:
+                      # Get alias for account
+                      alias = boto3.client('iam').list_account_aliases()['AccountAliases'][0]
+                      print(alias)
+                      if 'error' in event.keys():
+                          error = event['error']['Error']
+                          cause = event['error']['Cause']
+                          print (cause)
+                          # TODO notification about a unexpected error in the lambda that exectuded the compliance check 
+
+                      elif 'deafult' in event.keys():
+                          print(event['deafult']['Deafult']) 
+                          rule = str(event['detail']['findings'][0]['GeneratorId'])
+                          region  = str(event['region'])
+                          url =  "https://"+region+".console.aws.amazon.com/securityhub/home?region="+region+"#/findings"
+                          message = {
+                              'summary': "Automated Compliance",
+                              'title': "Compliance problem found by Deafult action. For account "+ alias +" in region "+ region, 
+                              'text': "Remediation needs to be created. For rule " + rule,
+                              'urlName': "AWS Security Hub findings",
+                              'url': url
+                          }
+                          message.update({'status': 'Alarm'})
+                          publish_compliance_sns(message)
+                          return message
+
+                      elif 'statusCode' in event.keys():
+                          function = event['body']['function']
+                          result = event['body']['result']
+                          if event['statusCode'] == 200:
+                              result_msg = event['body']['message']# the compliance could be corrected or is non correctable 
+                          elif event['statusCode'] == 500 :
+                              result_msg = event['body']['error']# unexpected but handled error 
+              
+                          rule = str(event['body']['event']['detail']['findings'][0]['GeneratorId'])
+                          region  = str(event['body']['event']['region'])
+                          url =  "https://"+region+".console.aws.amazon.com/securityhub/home?region="+region+"#/findings"
+
+                          message = {
+                              'summary': "Automated Compliance",
+                              'title': "Compliance " + result + " by " + function + ". For account "+ alias +" in region "+ region, 
+                              'text': result_msg + ". For rule " + rule,
+                              'urlName': "AWS Security Hub findings" ,
+                              'url': url
+                          }
+                          if result != "CORRECTED":
+                              message.update({'status': 'Alarm'})
+                          else:
+                              message.update({'status': 'No'})
+                          
+                          publish_compliance_sns(message)
+                          return message
+
+
+  ComplianceAutomationFinalStateLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Policies:
+        - PolicyName: ComplianceAutomationFinalState_LambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            - Effect: Allow
+              Action:
+              - cloudwatch:PutMetricData
+              Resource: '*'
+            - Effect: Allow
+              Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: '*'
+            - Effect: Allow
+              Action:
+              - iam:PassRole
+              - sns:Publish
+              - sns:ListTopics
+              - iam:ListAccountAliases
+              Resource: '*'
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action:
+            - sts:AssumeRole
+
+  ContinuousComplianceAutomationStatesExecutionRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - states.amazonaws.com
+              Action: "sts:AssumeRole"
+        Path: "/"
+        Policies:
+          - PolicyName: StatesExecutionPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - "lambda:InvokeFunction"
+                  Resource: "*"
+
+  ContinuousComplianceAutomationStateMachine:
+      Type: "AWS::StepFunctions::StateMachine"
+      Properties:
+        StateMachineName: ContinuousComplianceAutomationStateMachine
+        DefinitionString:
+          !Sub
+            - |-
+              {
+                "Comment": "Compliance Automation choosing between compliance remediations",
+                "StartAt": "ComplianceChoiceState",
+                "States": {
+                  "ComplianceChoiceState": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Or": [
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.5"
+                          },
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.6"
+                          },
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.7"
+                          },
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.8"
+                          },
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.9"
+                          },
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.10"
+                          },
+                          { "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.11"
+                          }        
+                        ],"Next": "ComplianceCIS15to111R"
+                      },
+                      {
+                        "Or": [
+                          {
+                            "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/4.1"
+                          },
+                          {
+                            "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/4.2"
+                          }
+                        ],
+                        "Next": "ComplianceCIS4142R"
+                      },
+                      {
+                        "Or": [
+                          {
+                            "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "pci-dss/v/3.2.1/PCI.S3.4"
+                          }
+                        ],
+                        "Next": "CompliancePCIS34R"
+                      },
+                      {
+                        "Or": [
+                          {
+                            "Variable": "$.detail.findings[0].GeneratorId",
+                            "StringEquals": "pci-dss/v/3.2.1/PCI.IAM.3"
+                          }
+                        ],
+                        "Next": "CompliancePCIIAM3R"
+                      }
+                      
+                    ],
+                    "Default": "DefaultState"
+                  },
+                  "ComplianceCIS15to111R": {
+                    "Type": "Task",
+                    "Resource":  "${lambdaCIS15to111RArn}",
+                    "Next": "FinalAutomationState",
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                          "Next": "CatchAllFallback",
+                          "ResultPath": "$.error" 
+                      }]
+                  },
+                  "ComplianceCIS4142R": {
+                    "Type": "Task",
+                    "Resource": "${lambdaCIS4142RArn}",
+                    "Next": "FinalAutomationState",
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                          "Next": "CatchAllFallback",
+                          "ResultPath": "$.error" 
+                      }]
+                  },
+                  "CompliancePCIS34R": {
+                    "Type": "Task",
+                    "Resource": "${lambdaPCIS34RArn}",
+                    "Next": "FinalAutomationState",
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                          "Next": "CatchAllFallback",
+                          "ResultPath": "$.error" 
+                      }]
+                  },
+                  "CompliancePCIIAM3R": {
+                    "Type": "Task",
+                    "Resource": "${lambdaPCIIAM3RArn}",
+                    "Next": "FinalAutomationState",
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                          "Next": "CatchAllFallback",
+                          "ResultPath": "$.error" 
+                      }]
+                  },
+                  "DefaultState": {
+                    "Type": "Pass",
+                    "Result":{
+                      "Deafult": "Yes"
+                    },
+                    "ResultPath": "$.deafult",
+                    "Next": "FinalAutomationState"
+                  },
+                  "CatchAllFallback": {
+                      "Type": "Pass",
+                      "Next": "FinalAutomationState"
+                  },
+                  "FinalAutomationState": {
+                  "Type": "Task",
+                  "Resource":  "${lambdaComplianceAutomationFinalStateArn}",
+                  "End": true
+                  }
+                }
+              }
+            - {lambdaCIS15to111RArn: !GetAtt [ ComplianceCIS15to111RLambdaFunction, Arn ],
+              lambdaCIS4142RArn: !GetAtt [ ComplianceCIS4142RLambdaFunction, Arn ],
+              lambdaPCIS34RArn: !GetAtt [ CompliancePCIS34RLambdaFunction, Arn ],
+              lambdaPCIIAM3RArn: !GetAtt [ CompliancePCIIAM3RLambdaFunction, Arn ],
+              lambdaComplianceAutomationFinalStateArn: !GetAtt [ ComplianceAutomationFinalStateLambdaFunction, Arn ]
+              }
+        RoleArn: !GetAtt [ ContinuousComplianceAutomationStatesExecutionRole, Arn ]
+
+  ContinuousComplianceAutomationExecuteStateMachineRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Sid: "AllowCWEServiceToAssumeRole"
+                Effect: "Allow"
+                Action:
+                  - "sts:AssumeRole"
+                Principal:
+                  Service:
+                    - "events.amazonaws.com"
+          Path: "/"
+          Policies:
+            -
+              PolicyName: "ExecuteStateMachine"
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  -
+                    Effect: "Allow"
+                    Action:
+                      - "states:StartExecution"
+                    Resource: "*"
+
+  ContinuousComplianceAutomationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ContinuousComplianceAutomation_CWER
+      Description: "Continuous Compliance Automation for CIS and PCI events from Security hub to Stepfunction with remediation lambdas"
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            RecordState:
+              - ACTIVE
+            Compliance:
+              Status:
+                - FAILED
+            GeneratorId:
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.5
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.6
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.7
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.8
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.9
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.10
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/1.11
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/4.1
+                - arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0/rule/4.2
+                - pci-dss/v/3.2.1/PCI.S3.4
+                - pci-dss/v/3.2.1/PCI.IAM.3
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Ref ContinuousComplianceAutomationStateMachine
+          RoleArn: !GetAtt
+            - ContinuousComplianceAutomationExecuteStateMachineRole
+            - Arn
+          Id: "ContinuousComplianceAutomation_CWE"
+
+  CreateActionTargetLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateActionTarget
+      Description: Custom resource to create an action target in Security Hub
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt CreateActionTargetLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          def lambda_handler(event, context):
+              # cfnhack
+              try:
+                  properties = event['ResourceProperties']
+                  region = os.environ['AWS_REGION']
+                  client = boto3.client('securityhub', region_name=region)
+                  responseData = {}
+                  if event['RequestType'] == 'Create':
+                      response = client.create_action_target(
+                          Name=properties['Name'],
+                          Description=properties['Description'],
+                          Id=properties['Id']
+                      )
+                      responseData['Arn'] = response['ActionTargetArn']
+                  elif event['RequestType'] == 'Delete':
+                      account_id = context.invoked_function_arn.split(":")[4]
+                      client.delete_action_target(
+                          ActionTargetArn=f"arn:aws:securityhub:{region}:{account_id}:action/custom/{properties['Id']}"
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  CreateActionTargetLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: CreateActionTarget-LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - securityhub:CreateActionTarget
+            - securityhub:DeleteActionTarget
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+  ComplianceAutomationActionTarget:
+    Type: Custom::ActionTarget
+    Version: 1.0
+    Properties:
+      ServiceToken: !GetAtt CreateActionTargetLambdaFunction.Arn
+      Name: ComplianceAutomation
+      Description: Send To Compliance Automation Response Remediation
+      Id: CARR
+  ComplianceAutomationSecurityHubActionTargetEventRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: ComplianceAutomationSecurityHubActionTarget_CWE
+      Description: "Send Compliance Automation Response Remediation from Security Hub Custom Action"
+      EventPattern: 
+        source: 
+          - aws.securityhub
+        detail-type: 
+          - Security Hub Findings - Custom Action
+        resources: 
+          - !GetAtt ComplianceAutomationActionTarget.Arn
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Ref ContinuousComplianceAutomationStateMachine
+          RoleArn: !GetAtt
+            - ContinuousComplianceAutomationExecuteStateMachineRole
+            - Arn
+          Id: "ComplianceAutomationSecurityHubActionTarget_CWE"
+
+  ComplianceTeamsWebHookLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ComplianceTeamsWebHook
+      Description: ComplianceTeamsWebHook
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt ComplianceTeamsWebHookLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+          TeamsHookUrl: TEAMS_HOOK_URL
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          TEAMS_HOOK_URL = os.environ['TeamsHookUrl']
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Event: " + str(event))
+              snsmessage = json.loads(event['Records'][0]['Sns']['Message'])
+              logger.info("Message: " + str(snsmessage))
+              summary = snsmessage['summary']
+              title = snsmessage['title'] 
+              text = snsmessage['text'] 
+              url = snsmessage['url']
+              urlName = snsmessage['urlName'] 
+              status = snsmessage['status']
+              data = {
+                  "colour": "64a837"
+              }
+              if status == "Alarm":
+                  data['colour'] = "d63333"
+                  
+              message = {
+                "@context": "https://schema.org/extensions",
+                "@type": "MessageCard",
+                "summary": summary, 
+                "themeColor": data["colour"],
+                "title": title,
+                "text": text,
+                "potentialAction": [
+                  {
+                    "@type": "OpenUri",
+                    "name": "Log in to AWS Console",
+                    "targets": [{
+                        "os": "default",
+                                  "uri": "TEMP"}]
+                  },
+                  {
+                    "@type": "OpenUri",
+                    "name": urlName,
+                    "targets": [{
+                        "os": "default",
+                        "uri": str(url)}]
+                  }
+                ]
+              }
+              req = Request(TEAMS_HOOK_URL, json.dumps(message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted")
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+  ComplianceTeamsWebHookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: ComplianceTeamsWebHook-LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - iam:PassRole
+            Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+
+  SnsTeamsComplianceTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: Teams Compliance Topic
+      TopicName: sns-teams-compliance-topic
+      Subscription:
+        - Endpoint: !GetAtt [ComplianceTeamsWebHookLambdaFunction, Arn]
+          Protocol: lambda
+    DependsOn: [ComplianceTeamsWebHookLambdaFunction]
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn:
+        Ref: SnsTeamsComplianceTopic
+      FunctionName:
+        Fn::GetAtt:
+        - ComplianceTeamsWebHookLambdaFunction
+        - Arn

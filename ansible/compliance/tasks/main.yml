@@ -1,0 +1,7 @@
+---
+
+- name: Configure compliance
+  include_tasks: configure_compliance.yaml
+  with_items: "{{ accounts }}"
+  loop_control:
+    loop_var: account_item

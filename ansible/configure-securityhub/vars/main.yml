@@ -1,0 +1,5 @@
+---
+region: "eu-west-1"
+s3BucketName: "{{ account_item.account_name }}-{{ region }}-config"
+kmsKeyId: "alias/{{ account_item.account_name }}-config-KMSKey"
+SNSTopicName: "{{ account_item.account_name }}-config-sns-topic"

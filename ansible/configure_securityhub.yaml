@@ -1,0 +1,7 @@
+- name: Configure the AWS securityhub and AWS config
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  roles:
+    - configure-securityhub

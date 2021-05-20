@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Enable support for AWS Config
+
+Parameters:
+  AccountName:
+    Type: String
+    Description: The AWS account name
+  EnvironmentPrefix:
+    Description: Output environment prefix used as identifier for resources. (optional)
+    Type: String
+    Default: ""
+    AllowedValues: ["", "dev", "tst", "prd" ]
+  S3BucketName:
+    Description: Output bucket name for AWS Config
+    Type: String
+    Default: ""
+  KmsKeyId: 
+    Description: Output KmsKeyId for the key used for encryption
+    Type: String
+    Default: ""
+  SNSTopicName:
+    Description: Name of the AWS Config SNS Topic
+    Type: String
+    Default: ""
+
+Conditions:
+  EnvironmentPrefixIsPresent: !Not [!Equals [!Ref EnvironmentPrefix, ""]]
+  isPrd: !Equals [!Ref EnvironmentPrefix, 'prd']
+  isTst: !Equals [!Ref EnvironmentPrefix, 'tst']
+  isDev: !Equals [!Ref EnvironmentPrefix, 'dev']
+  isPrdOrTstOrDev: !Or [Condition: isPrd, Condition: isTst, Condition: isDev]
+
+Resources:
+  # Define an KMS Key to Encrypt the Conifg Logs with
+  ConfigKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: AWS Config KMS Key
+      Enabled: 'true'
+      EnableKeyRotation: 'true'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: !Sub ${AWS::StackName}-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: 'kms:*'
+          Resource: '*'
+
+  SessionManagerKMSKeyAlias:
+    Type: "AWS::KMS::Alias"
+    Properties:
+      AliasName: !Ref KmsKeyId
+      TargetKeyId: !Ref ConfigKMSKey
+    DependsOn: ConfigKMSKey
+
+
+  EncryptedS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ConfigKMSKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+    # Make sure we don't delete the bucket by accident
+    DeletionPolicy: Retain
+    DependsOn: ConfigKMSKey
+
+  EncryptedS3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Join
+                - '-'
+                - - !Ref AccountName
+                  - !If [ EnvironmentPrefixIsPresent, !Ref EnvironmentPrefix, !Ref "AWS::NoValue"]
+                  - !If [ isPrdOrTstOrDev, 'runtime', !Ref "AWS::NoValue"]
+                  - !Sub "${AWS::Region}"
+                  - 'config'
+      PolicyDocument:
+        Statement:
+          #TODO only give instance profile arn connected to logstash-ApplicationIamRole access to bucket
+          #TODO define which roles should be able to delete the bucket policy
+          - Action:
+              - 's3:DeleteBucket'
+            Effect: Deny
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Join
+                  - '-'
+                  - - !Ref AccountName
+                    - !If [ EnvironmentPrefixIsPresent, !Ref EnvironmentPrefix, !Ref "AWS::NoValue"]
+                    - !If [ isPrdOrTstOrDev, 'runtime', !Ref "AWS::NoValue"]
+                    - !Sub "${AWS::Region}"
+                    - 'config'
+                - ''
+            Principal: '*'
+    DependsOn: EncryptedS3Bucket
+
+ # Define an SNS Topic for Logfile delivery
+  ConfigTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: AWS Config Topic
+      KmsMasterKeyId: !GetAtt ConfigKMSKey.Arn
+
+
+  ConfigTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref 'ConfigTopic']
+      PolicyDocument:
+        Version: '2008-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            AWS: "*"
+          Action:
+          - SNS:Publish
+          Resource: !Ref ConfigTopic
+          Condition:
+            StringEquals:
+              AWS:SourceOwner: !Ref "AWS::AccountId"
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties: 
+      ConfigSnapshotDeliveryProperties: 
+        DeliveryFrequency: "Six_Hours"
+      S3BucketName: !Ref EncryptedS3Bucket
+      SnsTopicARN: !Ref ConfigTopic
+
+  ConfigRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSConfigRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AssumeRole1
+          Effect: Allow
+          Principal:
+            Service: 'config.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: 's3-config-policy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 's3:PutObject'
+            Resource: !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref 'EncryptedS3Bucket'
+                    - '/*'
+            Condition:
+              StringLike:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+          - Effect: Allow
+            Action: 's3:GetBucketAcl'
+            Resource: !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref 'EncryptedS3Bucket'
+      - PolicyName: 'config-policy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 'sns:Publish'
+            Resource: !Ref ConfigTopic
+          - Effect: Allow
+            Action: config:Put*
+            Resource: "*"
+
+  ConfigurationRecorder:
+      Type: 'AWS::Config::ConfigurationRecorder'
+      Properties:
+        Name: aws-config-recorder
+        RecordingGroup:
+          AllSupported: true
+          IncludeGlobalResourceTypes: true
+        RoleARN: !GetAtt 'ConfigRole.Arn'
+
+  
+
+
+  

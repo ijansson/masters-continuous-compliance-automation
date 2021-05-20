@@ -1,0 +1,27 @@
+---
+
+- name: Configure AWS Config CF-stack for all accounts
+  cloudformation:
+    profile: "{{ account_item.account_name }}"
+    stack_name: "{{ account_item.account_name }}-config-cf"
+    state: "present"
+    region: "{{ account_item.default_region | default('eu-west-1') }}"
+    disable_rollback: true
+    template: "roles/configure-securityhub/files/configure_securityhub.yaml"
+    template_parameters:
+      AccountName: "{{ account_item.account_name }}"
+      EnvironmentPrefix: ""
+      S3BucketName: "{{ s3BucketName }}"
+      KmsKeyId: "{{ kmsKeyId }}"
+      SNSTopicName: "{{ SNSTopicName }}"
+    tags:
+      Account: "{{ account_item.account_name }}"
+      Stack: "{{ account_item.account_name }}-config-cf"
+      Contact: "{{ account_item.owner_email }}"
+      CostCenter: "{{ account_item.owner_costcenter }}"
+  register: register_securityhub
+
+- name: Enable securityhub
+  shell:  aws securityhub enable-security-hub  --profile "{{ account_item.account_name  }}"
+  register: securityhub_output
+  ignore_errors: True
